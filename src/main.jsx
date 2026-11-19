@@ -77,6 +77,31 @@ const fmt = (v) =>
   Number(ethers.formatUnits(v, 18)).toLocaleString(undefined, {
     maximumFractionDigits: 4,
   });
+// Resolve the active injected EVM wallet. Some mobile wallet browsers expose
+// multiple providers through window.ethereum.providers rather than directly.
+function getInjectedWallet() {
+  if (typeof window === "undefined") return null;
+  const ethereum = window.ethereum;
+  if (!ethereum) return null;
+  const providers = Array.isArray(ethereum.providers)
+    ? ethereum.providers
+    : [ethereum];
+  return providers.find((wallet) => wallet?.isMetaMask) ||
+    providers.find((wallet) => wallet?.request) ||
+    null;
+}
+
+function isMobileBrowser() {
+  return typeof navigator !== "undefined" &&
+    /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
+
+function openMetaMaskApp() {
+  if (typeof window === "undefined") return;
+  const currentDapp = `${window.location.host}${window.location.pathname}${window.location.search}${window.location.hash}`;
+  window.location.href = `https://metamask.app.link/dapp/${currentDapp}`;
+}
+
 function App() {
   const [page, setPage] = useState("Home"),
     [mobile, setMobile] = useState(false),
@@ -128,8 +153,15 @@ function App() {
   async function buyTkaWithBnb() {
     setPaymentMessage("");
     try {
-      if (!window.ethereum)
-        throw Error("Install MetaMask or a compatible wallet first.");
+      const wallet = getInjectedWallet();
+      if (!wallet) {
+        if (isMobileBrowser()) {
+          setPaymentMessage("Opening MetaMask. If prompted, open this site in MetaMask and tap Connect Wallet again.");
+          openMetaMaskApp();
+          return;
+        }
+        throw Error("No EVM wallet detected. Install MetaMask or open this site in a wallet browser.");
+      }
       if (!bnbUsd)
         throw Error(
           "The live BNB/USD quote is unavailable. Please try again shortly.",
@@ -141,21 +173,21 @@ function App() {
       if (!Number.isFinite(bnbAmount) || bnbAmount <= 0)
         throw Error("Invalid BNB amount.");
       setPaymentBusy(true);
-      await window.ethereum.request({ method: "eth_requestAccounts" });
+      await wallet.request({ method: "eth_requestAccounts" });
       try {
-        await window.ethereum.request({
+        await wallet.request({
           method: "wallet_switchEthereumChain",
           params: [{ chainId: "0x38" }],
         });
       } catch (e) {
         if (e.code === 4902)
-          await window.ethereum.request({
+          await wallet.request({
             method: "wallet_addEthereumChain",
             params: [MAINNET_CHAIN],
           });
         else throw e;
       }
-      const payProvider = new ethers.BrowserProvider(window.ethereum);
+      const payProvider = new ethers.BrowserProvider(wallet);
       const signer = await payProvider.getSigner();
       const buyer = await signer.getAddress();
       const amount = ethers.parseEther(bnbAmount.toFixed(8));
@@ -279,10 +311,11 @@ function App() {
     }
   }, [demoKey]);
   async function signInDemo() {
-    if (!account || !window.ethereum)
+    const wallet = getInjectedWallet();
+    if (!account || !wallet)
       return alert("Connect your wallet first.");
     try {
-      const p = new ethers.BrowserProvider(window.ethereum);
+      const p = new ethers.BrowserProvider(wallet);
       if (Number((await p.getNetwork()).chainId) !== CHAIN)
         throw Error("Switch to the configured test network first.");
       const signer = await p.getSigner();
@@ -327,11 +360,18 @@ function App() {
   const alert = (m) => setNotice(m);
   async function connect() {
     try {
-      if (!window.ethereum)
-        throw Error("Install MetaMask or another injected EVM wallet.");
-      await window.ethereum.request({ method: "eth_requestAccounts" });
-      await switchNetwork();
-      const p = new ethers.BrowserProvider(window.ethereum);
+      const wallet = getInjectedWallet();
+      if (!wallet) {
+        if (isMobileBrowser()) {
+          alert("Opening MetaMask. If it asks, choose to open this site in MetaMask, then tap Connect Wallet again.");
+          openMetaMaskApp();
+          return;
+        }
+        throw Error("No EVM wallet detected. Install a wallet extension or open this site in a wallet browser.");
+      }
+      await wallet.request({ method: "eth_requestAccounts" });
+      await switchNetwork(wallet);
+      const p = new ethers.BrowserProvider(wallet);
       const s = await p.getSigner();
       setProvider(p);
       setAccount(await s.getAddress());
@@ -340,15 +380,16 @@ function App() {
       alert(e.shortMessage || e.message);
     }
   }
-  async function switchNetwork() {
+  async function switchNetwork(wallet = getInjectedWallet()) {
+    if (!wallet) throw Error("No injected EVM wallet detected.");
     try {
-      await window.ethereum.request({
+      await wallet.request({
         method: "wallet_switchEthereumChain",
         params: [{ chainId: chain.chainId }],
       });
     } catch (e) {
       if (e.code === 4902)
-        await window.ethereum.request({
+        await wallet.request({
           method: "wallet_addEthereumChain",
           params: [chain],
         });
@@ -409,24 +450,24 @@ function App() {
     }
   }
   useEffect(() => {
-    if (!window.ethereum) return;
+    const wallet = getInjectedWallet();
+    if (!wallet) return;
     const init = async () => {
       try {
-        let a = await window.ethereum.request({ method: "eth_accounts" });
-        if (a.length) {
-          let p = new ethers.BrowserProvider(window.ethereum);
-          setProvider(p);
-          setAccount(a[0]);
+        const accounts = await wallet.request({ method: "eth_accounts" });
+        if (accounts.length) {
+          setProvider(new ethers.BrowserProvider(wallet));
+          setAccount(accounts[0]);
         }
       } catch {}
     };
     init();
-    const changed = () => location.reload();
-    window.ethereum.on?.("accountsChanged", changed);
-    window.ethereum.on?.("chainChanged", changed);
+    const changed = () => window.location.reload();
+    wallet.on?.("accountsChanged", changed);
+    wallet.on?.("chainChanged", changed);
     return () => {
-      window.ethereum.removeListener?.("accountsChanged", changed);
-      window.ethereum.removeListener?.("chainChanged", changed);
+      wallet.removeListener?.("accountsChanged", changed);
+      wallet.removeListener?.("chainChanged", changed);
     };
   }, []);
   useEffect(() => {
@@ -440,8 +481,10 @@ function App() {
       return alert("Staking contract is not configured.");
     setBusy(true);
     try {
-      await switchNetwork();
-      const p = new ethers.BrowserProvider(window.ethereum),
+      const wallet = getInjectedWallet();
+      if (!wallet) throw Error("Reconnect your wallet to continue.");
+      await switchNetwork(wallet);
+      const p = new ethers.BrowserProvider(wallet),
         signer = await p.getSigner();
       await fn(signer);
       await refresh(p, await signer.getAddress());

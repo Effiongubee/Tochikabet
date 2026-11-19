@@ -218,15 +218,19 @@ function App() {
       const buyer = await signer.getAddress();
       const amount = ethers.parseEther(bnbAmount.toFixed(8));
       const walletBalance = await payProvider.getBalance(buyer);
-      // TREASURY is a normal externally owned wallet, so a native BNB transfer
-      // uses the standard 21,000 gas limit. Supplying it explicitly avoids a
-      // flaky wallet/RPC eth_estimateGas simulation returning "missing revert data".
-      const gasLimit = 21000n;
       const feeData = await payProvider.getFeeData();
-      const gasPrice = feeData.gasPrice ?? feeData.maxFeePerGas ?? 0n;
-      const estimatedGasCost = gasPrice > 0n ? gasLimit * gasPrice : 0n;
+      // A native BNB transfer to the treasury wallet (an externally owned account)
+      // uses the standard 21,000 gas limit. Avoid estimateGas here because some
+      // wallet/RPC combinations return "missing revert data" for this simple transfer.
+      const gasLimit = 21000n;
+      const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice;
+      if (!gasPrice) {
+        throw Error("Could not read the current BNB Smart Chain network fee. Please try again.");
+      }
+      // Add a 20% buffer to the balance check in case the network fee changes slightly.
+      const estimatedGasCost = (gasLimit * gasPrice * 120n) / 100n;
       if (walletBalance < amount + estimatedGasCost)
-        throw Error("Insufficient BNB for this purchase plus the network gas fee.");
+        throw Error("Insufficient BNB for this purchase plus the network gas fee. Please add a little BNB for gas and try again.");
       setPaymentMessage("Confirm the BNB payment in your wallet. Only send through this page.");
       const tx = await signer.sendTransaction({ to: TREASURY, value: amount, gasLimit });
       setPaymentMessage(`Transaction sent: ${tx.hash}. Waiting for 3 BNB Smart Chain confirmations…`);

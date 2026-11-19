@@ -13,7 +13,7 @@ import {
   CheckCircle2,
 } from "lucide-react";
 import "./style.css";
-const CHAIN = Number(import.meta.env.VITE_CHAIN_ID || 97),
+const CHAIN = Number(import.meta.env.VITE_CHAIN_ID || 56),
   TEST = CHAIN === 97;
 const chain = TEST
   ? {
@@ -57,17 +57,7 @@ const stakeABI = [
   "function stakes(uint256) view returns(address staker,uint256 amount,uint256 reward,uint256 startTime,uint256 unlockTime,uint256 planId,bool withdrawn)",
   "function plans(uint256) view returns(uint256 duration,uint256 rewardBps,bool active)",
 ];
-// Genesis prototype is deliberately READ ONLY. Never use the legacy sale address here.
-const genesisAddress = import.meta.env.VITE_GENESIS_PRESALE_ADDRESS || "";
-const genesisConfigured = TEST && ethers.isAddress(genesisAddress);
-const genesisABI = [
-  "function allocationOf(address) view returns(uint256)",
-  "function contributionOf(address) view returns(uint256)",
-  "function totalAllocated() view returns(uint256)",
-  "function saleOpen() view returns(bool)",
-  "function refundsEnabled() view returns(bool)",
-];
-const PAYMENT_API_BASE = (import.meta.env.VITE_PAYMENT_API_URL || "").replace(
+const PAYMENT_API_BASE = (import.meta.env.VITE_PAYMENT_API_URL || "https://tochika-payment-api.onrender.com").replace(
   /\/$/,
   "",
 );
@@ -77,6 +67,10 @@ const fmt = (v) =>
   Number(ethers.formatUnits(v, 18)).toLocaleString(undefined, {
     maximumFractionDigits: 4,
   });
+const recordTxHash = (r) => r.txHash || r.tx_hash || r.transactionHash || r.transaction_hash || "";
+const recordTka = (r) => Number(r.tka ?? r.tokenAmount ?? r.token_amount ?? r.token_allocation ?? r.allocation ?? 0);
+const recordBnb = (r) => Number(r.bnb ?? r.bnbAmount ?? r.bnb_amount ?? 0);
+const recordCreatedAt = (r) => r.createdAt || r.created_at || r.timestamp || r.blockTimestamp || null;
 // Resolve the active injected EVM wallet. Some mobile wallet browsers expose
 // multiple providers through window.ethereum.providers rather than directly.
 function getInjectedWallet() {
@@ -120,6 +114,9 @@ function App() {
   const [bnbUsd, setBnbUsd] = useState(null);
   const [paymentBusy, setPaymentBusy] = useState(false);
   const [paymentRecords, setPaymentRecords] = useState([]);
+  const [paymentRecordsLoading, setPaymentRecordsLoading] = useState(false);
+  const [paymentRecordsError, setPaymentRecordsError] = useState("");
+  const [quoteError, setQuoteError] = useState("");
   const [paymentMessage, setPaymentMessage] = useState("");
   const TREASURY = "0x77b384DB595801bc57B62b71607e1DE6d341acB8";
   const TOKEN_PRICE_USD = 0.0009;
@@ -130,22 +127,60 @@ function App() {
     rpcUrls: ["https://bsc-dataseed.binance.org"],
     blockExplorerUrls: ["https://bscscan.com"],
   };
+  async function refreshPaymentQuote() {
+    try {
+      const response = await fetch(apiUrl("/api/quote"), { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw Error(data.error || "Unable to load the live BNB quote.");
+      if (Number(data.chainId) !== 56) throw Error("Payment API is not configured for BNB Smart Chain Mainnet.");
+      if (data.treasury && data.treasury.toLowerCase() !== TREASURY.toLowerCase())
+        throw Error("Payment API treasury does not match the official Tochika receiving wallet.");
+      if (!Number.isFinite(Number(data.bnbUsd)) || Number(data.bnbUsd) <= 0)
+        throw Error("The payment API returned an invalid BNB price.");
+      setBnbUsd(Number(data.bnbUsd));
+      setQuoteError("");
+    } catch (e) {
+      setQuoteError(e.message || "Live BNB quote unavailable.");
+    }
+  }
+  async function refreshPaymentRecords(wallet = account) {
+    if (!wallet) {
+      setPaymentRecords([]);
+      setPaymentRecordsError("");
+      return [];
+    }
+    setPaymentRecordsLoading(true);
+    setPaymentRecordsError("");
+    try {
+      const response = await fetch(apiUrl(`/api/purchases/${wallet}`), { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw Error(data.error || "Could not load verified purchases.");
+      const rows = Array.isArray(data)
+        ? data
+        : Array.isArray(data.purchases)
+          ? data.purchases
+          : Array.isArray(data.records)
+            ? data.records
+            : [];
+      setPaymentRecords(rows);
+      return rows;
+    } catch (e) {
+      setPaymentRecordsError(e.message || "Could not load verified purchases.");
+      setPaymentRecords([]);
+      return [];
+    } finally {
+      setPaymentRecordsLoading(false);
+    }
+  }
   useEffect(() => {
-    fetch(apiUrl("/api/quote"))
-      .then((r) => r.json())
-      .then((d) => {
-        if (d.bnbUsd > 0) setBnbUsd(d.bnbUsd);
-      })
-      .catch(() => {});
+    refreshPaymentQuote();
+    const timer = window.setInterval(refreshPaymentQuote, 60000);
+    return () => window.clearInterval(timer);
   }, []);
   useEffect(() => {
-    if (account)
-      fetch(apiUrl(`/api/purchases/${account}`))
-        .then((r) => (r.ok ? r.json() : []))
-        .then(setPaymentRecords)
-        .catch(() => setPaymentRecords([]));
-    else setPaymentRecords([]);
+    refreshPaymentRecords(account);
   }, [account]);
+  const purchasedTkaTotal = paymentRecords.reduce((sum, row) => sum + recordTka(row), 0);
   const estimatedBnb =
     bnbUsd && Number(presaleUsd) > 0 ? Number(presaleUsd) / bnbUsd : 0;
   const estimatedTka =
@@ -153,6 +188,7 @@ function App() {
   async function buyTkaWithBnb() {
     setPaymentMessage("");
     try {
+      if (!PAYMENT_API_BASE) throw Error("Payment API URL is missing. Set VITE_PAYMENT_API_URL in Vercel and redeploy.");
       const wallet = getInjectedWallet();
       if (!wallet) {
         if (isMobileBrowser()) {
@@ -162,201 +198,75 @@ function App() {
         }
         throw Error("No EVM wallet detected. Install MetaMask or open this site in a wallet browser.");
       }
-      if (!bnbUsd)
-        throw Error(
-          "The live BNB/USD quote is unavailable. Please try again shortly.",
-        );
+      if (!bnbUsd) throw Error(quoteError || "The live BNB/USD quote is unavailable. Please try again shortly.");
       const usd = Number(presaleUsd);
       if (!Number.isFinite(usd) || usd < 5 || usd > 18000)
         throw Error("Enter an amount between $5 and $18,000.");
       const bnbAmount = usd / bnbUsd;
-      if (!Number.isFinite(bnbAmount) || bnbAmount <= 0)
-        throw Error("Invalid BNB amount.");
+      if (!Number.isFinite(bnbAmount) || bnbAmount <= 0) throw Error("Invalid BNB amount.");
       setPaymentBusy(true);
       await wallet.request({ method: "eth_requestAccounts" });
       try {
-        await wallet.request({
-          method: "wallet_switchEthereumChain",
-          params: [{ chainId: "0x38" }],
-        });
+        await wallet.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x38" }] });
       } catch (e) {
-        if (e.code === 4902)
-          await wallet.request({
-            method: "wallet_addEthereumChain",
-            params: [MAINNET_CHAIN],
-          });
-        else throw e;
+        if (e.code === 4902) {
+          await wallet.request({ method: "wallet_addEthereumChain", params: [MAINNET_CHAIN] });
+        } else throw e;
       }
       const payProvider = new ethers.BrowserProvider(wallet);
       const signer = await payProvider.getSigner();
       const buyer = await signer.getAddress();
       const amount = ethers.parseEther(bnbAmount.toFixed(8));
-      const balance = await payProvider.getBalance(buyer);
-      if (balance < amount)
-        throw Error("Insufficient BNB for this purchase and network gas.");
-      setPaymentMessage(
-        "Confirm the BNB payment in your wallet. Do not close this page.",
-      );
+      const walletBalance = await payProvider.getBalance(buyer);
+      const feeData = await payProvider.getFeeData();
+      const gasLimit = await payProvider.estimateGas({ from: buyer, to: TREASURY, value: amount });
+      const gasPrice = feeData.maxFeePerGas || feeData.gasPrice;
+      const estimatedGasCost = gasPrice ? gasLimit * gasPrice : 0n;
+      if (walletBalance < amount + estimatedGasCost)
+        throw Error("Insufficient BNB for this purchase plus the network gas fee.");
+      setPaymentMessage("Confirm the BNB payment in your wallet. Only send through this page.");
       const tx = await signer.sendTransaction({ to: TREASURY, value: amount });
-      setPaymentMessage(
-        `Transaction sent: ${tx.hash}. Waiting for network confirmation…`,
-      );
-      const receipt = await tx.wait(1);
-      if (!receipt || receipt.status !== 1)
-        throw Error("The BNB transaction was not successful.");
-      setPaymentMessage(
-        "Payment confirmed. Verifying it and recording your TKA allocation…",
-      );
-      const response = await fetch(apiUrl("/api/verify-payment"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ txHash: tx.hash, buyer, usdAmount: usd }),
-      });
-      const result = await response.json();
-      if (!response.ok)
-        throw Error(
-          result.error ||
-            "Payment verification failed. Contact support with your transaction hash.",
-        );
-      setPaymentMessage(
-        `Payment verified! ${Number(result.tka).toLocaleString()} TKA allocation recorded. Transaction: ${tx.hash}`,
-      );
-      const rows = await fetch(apiUrl(`/api/purchases/${buyer}`)).then((r) =>
-        r.json(),
-      );
-      setPaymentRecords(rows);
+      setPaymentMessage(`Transaction sent: ${tx.hash}. Waiting for 3 BNB Smart Chain confirmations…`);
+      const receipt = await tx.wait(3);
+      if (!receipt || receipt.status !== 1) throw Error("The BNB transaction was not successful.");
+      setPaymentMessage("Three confirmations received. Asking the Tochika server to verify your payment…");
+      let response;
+      let result;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        response = await fetch(apiUrl("/api/verify-payment"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ txHash: tx.hash, buyer }),
+        });
+        result = await response.json();
+        if (response.ok) break;
+        const waitingForChain = response.status === 409 && /confirm|waiting|not yet visible/i.test(result.error || "");
+        if (waitingForChain && attempt < 3) {
+          setPaymentMessage("The payment is on-chain. Waiting briefly for the payment server to catch up with BNB Smart Chain…");
+          await new Promise((resolve) => window.setTimeout(resolve, 3500));
+          continue;
+        }
+        if (response.status === 409 && /already.*recorded/i.test(result.error || "")) {
+          const rows = await refreshPaymentRecords(buyer);
+          const existing = rows.find((row) => recordTxHash(row).toLowerCase() === tx.hash.toLowerCase());
+          if (existing) {
+            setPaymentMessage(`This payment was already verified. ${recordTka(existing).toLocaleString()} TKA allocation is recorded.`);
+            return;
+          }
+        }
+        throw Error(result.error || "Payment verification failed. Keep your transaction hash and contact support.");
+      }
+      if (!response?.ok) throw Error(result?.error || "Payment verification is still pending. Refresh your purchase history in a moment.");
+      const allocation = Number(result.tka ?? result.tokenAmount ?? result.token_amount ?? 0);
+      setPaymentMessage(`Payment verified! ${allocation.toLocaleString()} TKA allocation recorded. Transaction: ${tx.hash}`);
+      await refreshPaymentRecords(buyer);
+      setPresaleUsd("20");
     } catch (e) {
-      setPaymentMessage(
-        e.shortMessage || e.message || "Payment could not be completed.",
-      );
+      setPaymentMessage(e.shortMessage || e.message || "Payment could not be completed.");
     } finally {
       setPaymentBusy(false);
     }
   }
-  const [genesis, setGenesis] = useState({
-    loading: false,
-    allocation: null,
-    contributed: null,
-    total: null,
-    open: false,
-    refunds: false,
-    error: "",
-  });
-  async function refreshGenesis(wallet = account) {
-    if (!wallet || !genesisConfigured) return;
-    setGenesis((g) => ({ ...g, loading: true, error: "" }));
-    try {
-      const rpc = new ethers.JsonRpcProvider(chain.rpcUrls[0], CHAIN);
-      const code = await rpc.getCode(genesisAddress);
-      if (code === "0x")
-        throw Error(
-          "No Genesis contract deployed at the configured Testnet address.",
-        );
-      const c = new ethers.Contract(genesisAddress, genesisABI, rpc);
-      const [allocation, contributed, total, open, refunds] = await Promise.all(
-        [
-          c.allocationOf(wallet),
-          c.contributionOf(wallet),
-          c.totalAllocated(),
-          c.saleOpen(),
-          c.refundsEnabled(),
-        ],
-      );
-      setGenesis({
-        loading: false,
-        allocation: ethers.formatUnits(allocation, 18),
-        contributed: ethers.formatEther(contributed),
-        total: ethers.formatUnits(total, 18),
-        open,
-        refunds,
-        error: "",
-      });
-    } catch (e) {
-      setGenesis((g) => ({
-        ...g,
-        loading: false,
-        allocation: null,
-        contributed: null,
-        total: null,
-        error: e.shortMessage || e.message,
-      }));
-    }
-  }
-  useEffect(() => {
-    setGenesis({
-      loading: false,
-      allocation: null,
-      contributed: null,
-      total: null,
-      open: false,
-      refunds: false,
-      error: "",
-    });
-    if (account && genesisConfigured) refreshGenesis(account);
-  }, [account]);
-
-  const [demoAuth, setDemoAuth] = useState(false);
-  const [demoRecords, setDemoRecords] = useState([]);
-  const demoKey = account
-    ? `tochika_genesis_demo_v1_${CHAIN}_${account.toLowerCase()}`
-    : "";
-  useEffect(() => {
-    setDemoAuth(false);
-    try {
-      setDemoRecords(
-        demoKey ? JSON.parse(localStorage.getItem(demoKey) || "[]") : [],
-      );
-    } catch {
-      setDemoRecords([]);
-    }
-  }, [demoKey]);
-  async function signInDemo() {
-    const wallet = getInjectedWallet();
-    if (!account || !wallet)
-      return alert("Connect your wallet first.");
-    try {
-      const p = new ethers.BrowserProvider(wallet);
-      if (Number((await p.getNetwork()).chainId) !== CHAIN)
-        throw Error("Switch to the configured test network first.");
-      const signer = await p.getSigner();
-      if ((await signer.getAddress()).toLowerCase() !== account.toLowerCase())
-        throw Error("Wallet account changed. Reconnect first.");
-      const nonce = ethers.hexlify(ethers.randomBytes(16));
-      const message = `TOCHIKA local preview sign-in\nDomain: ${window.location.host}\nWallet: ${account}\nChain ID: ${CHAIN}\nNonce: ${nonce}\nThis signature does not authorize a payment or token transfer.`;
-      const signature = await signer.signMessage(message);
-      if (
-        ethers.verifyMessage(message, signature).toLowerCase() !==
-        account.toLowerCase()
-      )
-        throw Error("Signature verification failed.");
-      setDemoAuth(true);
-      alert(
-        "Wallet signature verified for this browser session. No backend account has been created.",
-      );
-    } catch (e) {
-      alert(e.shortMessage || e.message);
-    }
-  }
-  function saveDemoAllocation() {
-    const usd = Number(presaleUsd);
-    if (!demoAuth || !account) return alert("Sign in with your wallet first.");
-    if (!Number.isFinite(usd) || usd <= 0 || usd > 18000)
-      return alert("Enter a preview amount between $0 and $18,000.");
-    const row = {
-      id: crypto.randomUUID(),
-      usd,
-      tka: usd / 0.0009,
-      created: new Date().toISOString(),
-      status: "LOCAL DEMO — NOT PURCHASED",
-    };
-    const next = [row, ...demoRecords];
-    localStorage.setItem(demoKey, JSON.stringify(next));
-    setDemoRecords(next);
-    alert(
-      "Practice allocation saved locally. No BNB was sent and no tokens were purchased.",
-    );
-  }
-  const demoTotal = demoRecords.reduce((sum, r) => sum + r.tka, 0);
   const alert = (m) => setNotice(m);
   async function connect() {
     try {
@@ -1077,9 +987,9 @@ function App() {
                   </strong>
                 </div>
                 <p className="muted tiny">
-                  The final BNB amount is calculated from the displayed quote
-                  when you submit. Network gas is paid separately by the buyer.
+                  The final BNB amount is calculated from the live quote when you submit. Network gas is paid separately by the buyer. The server independently verifies the transaction and calculates the final TKA allocation.
                 </p>
+                {quoteError && <p className="muted tiny" role="alert">{quoteError}</p>}
                 <button
                   className="primary full"
                   disabled={!account || paymentBusy || !bnbUsd || !estimatedBnb}
@@ -1118,10 +1028,11 @@ function App() {
                 </div>
                 <div className="info">
                   <span>Distribution</span>
-                  <strong>
-                    {" "}
-                    Allocation available for transaction after TGE{" "}
-                  </strong>
+                  <strong>Recorded now · distributed separately</strong>
+                </div>
+                <div className="info">
+                  <span>Your verified allocation</span>
+                  <strong>{purchasedTkaTotal.toLocaleString(undefined, { maximumFractionDigits: 2 })} TKA</strong>
                 </div>
                 <p className="muted tiny">
                   This payment sends native BNB directly to the treasury wallet.
@@ -1129,27 +1040,22 @@ function App() {
                 </p>
                 <h3>My verified purchases</h3>
                 {paymentRecords.length ? (
-                  paymentRecords.map((r) => (
-                    <div className="info" key={r.txHash}>
-                      <span>
-                        {Number(r.bnb).toFixed(6)} BNB ·{" "}
-                        {new Date(r.createdAt).toLocaleString()}
-                      </span>
-                      <strong>
-                        {Number(r.tka).toLocaleString()} TKA ·{" "}
-                        <a
-                          href={`https://bscscan.com/tx/${r.txHash}`}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          View tx
-                        </a>
-                      </strong>
-                    </div>
-                  ))
+                  paymentRecords.map((r) => {
+                    const hash = recordTxHash(r);
+                    const created = recordCreatedAt(r);
+                    return (
+                      <div className="info" key={hash || `${recordBnb(r)}-${created}`}>
+                        <span>{recordBnb(r).toFixed(6)} BNB{created ? ` · ${new Date(created).toLocaleString()}` : ""}</span>
+                        <strong>
+                          {recordTka(r).toLocaleString(undefined, { maximumFractionDigits: 2 })} TKA
+                          {hash && <> · <a href={`https://bscscan.com/tx/${hash}`} target="_blank" rel="noreferrer">View tx</a></>}
+                        </strong>
+                      </div>
+                    );
+                  })
                 ) : (
                   <p className="muted tiny">
-                    No verified purchases recorded for this wallet yet.
+                    {paymentRecordsLoading ? "Loading your verified purchases…" : paymentRecordsError || "No verified purchases recorded for this wallet yet."}
                   </p>
                 )}
               </div>
@@ -1253,8 +1159,7 @@ function App() {
             {!account ? (
               <div className="card">
                 <p>
-                  Connect your wallet to view your TKA balance, BNB testnet
-                  balance and any staking positions linked to this wallet.
+                  Connect your wallet to view your verified purchased TKA allocation, on-chain token balance, BNB balance and separate TochikaBet rewards.
                 </p>
                 <button className="primary" onClick={connect}>
                   Connect wallet
@@ -1262,95 +1167,56 @@ function App() {
               </div>
             ) : (
               <>
-                <div className="grid three">
+                <div className="grid two">
                   <div className="card stat">
                     <small>Connected wallet</small>
                     <strong>{short(account)}</strong>
+                  </div>
+                  <div className="card stat">
+                    <small>Purchased TKA allocation</small>
+                    <strong>{purchasedTkaTotal.toLocaleString(undefined, { maximumFractionDigits: 2 })}</strong>
                   </div>
                   <div className="card stat">
                     <small>On-chain TKA balance</small>
                     <strong>{balance}</strong>
                   </div>
                   <div className="card stat">
-                    <small>BNB balance</small>
+                    <small>BNB Mainnet balance</small>
                     <strong>{bnb || "—"}</strong>
                   </div>
                 </div>
                 <div className="card presale-dashboard">
                   <div className="row between">
-                    <h3>Verified Genesis Testnet records</h3>
-                    <button
-                      className="secondary"
-                      disabled={!genesisConfigured || genesis.loading}
-                      onClick={() => refreshGenesis()}
-                    >
-                      {genesis.loading ? "Checking…" : "Refresh on-chain"}
+                    <h3>My verified TKA purchases</h3>
+                    <button className="secondary" disabled={paymentRecordsLoading} onClick={() => refreshPaymentRecords()}>
+                      {paymentRecordsLoading ? "Refreshing…" : "Refresh purchases"}
                     </button>
                   </div>
-                  {!genesisConfigured ? (
-                    <p className="muted tiny">
-                      Read-only integration not configured. Deploy and
-                      independently test the prototype on BSC Testnet, then set
-                      VITE_GENESIS_PRESALE_ADDRESS. No payment is enabled.
-                    </p>
-                  ) : genesis.error ? (
-                    <p className="muted tiny" role="alert">
-                      Unable to verify contract records: {genesis.error}
-                    </p>
-                  ) : genesis.allocation === null ? (
-                    <p className="muted tiny">
-                      {genesis.loading
-                        ? "Reading Testnet contract…"
-                        : "No verified contract data loaded."}
-                    </p>
-                  ) : (
-                    <>
-                      <div className="grid three">
-                        <div>
-                          <small>Recorded Testnet allocation</small>
-                          <div className="presale-number">
-                            {Number(genesis.allocation).toLocaleString(
-                              undefined,
-                              { maximumFractionDigits: 2 },
-                            )}{" "}
-                            TKA
-                          </div>
-                        </div>
-                        <div>
-                          <small>Testnet BNB contributed</small>
-                          <div className="presale-number">
-                            {Number(genesis.contributed).toLocaleString(
-                              undefined,
-                              { maximumFractionDigits: 5 },
-                            )}{" "}
-                            tBNB
-                          </div>
-                        </div>
-                        <div>
-                          <small>Prototype status</small>
-                          <div className="presale-number">
-                            {genesis.refunds
-                              ? "Refund mode"
-                              : genesis.open
-                                ? "Testnet open"
-                                : "Closed"}
-                          </div>
-                        </div>
+                  <div className="presale-number">
+                    {purchasedTkaTotal.toLocaleString(undefined, { maximumFractionDigits: 2 })} TKA
+                  </div>
+                  <p className="muted tiny">
+                    This is your verified purchased allocation, not your current on-chain token balance. BNB payments are recorded by the payment server; TKA distribution happens separately after the official distribution process.
+                  </p>
+                  {paymentRecordsError && <p className="muted tiny" role="alert">{paymentRecordsError}</p>}
+                  {paymentRecords.length ? paymentRecords.map((row) => {
+                    const hash = recordTxHash(row);
+                    const created = recordCreatedAt(row);
+                    return (
+                      <div className="info" key={hash || `${recordBnb(row)}-${created}`}>
+                        <span>{recordBnb(row).toFixed(6)} BNB{created ? ` · ${new Date(created).toLocaleString()}` : ""}</span>
+                        <strong>
+                          {recordTka(row).toLocaleString(undefined, { maximumFractionDigits: 2 })} TKA
+                          {hash && <> · <a href={`https://bscscan.com/tx/${hash}`} target="_blank" rel="noreferrer">View tx</a></>}
+                        </strong>
                       </div>
-                      <p className="muted tiny">
-                        Contract-wide recorded allocation:{" "}
-                        {Number(genesis.total).toLocaleString(undefined, {
-                          maximumFractionDigits: 2,
-                        })}{" "}
-                        / 20,000,000 TKA. These are TESTNET accounting records
-                        only, not Mainnet TKA or a promise of distribution.
-                      </p>
-                    </>
-                  )}
+                    );
+                  }) : <p className="muted tiny">No verified purchases recorded for this wallet yet.</p>}
+                  <button className="secondary" onClick={() => setPage("Buy TKA")}>Buy more TKA</button>
                 </div>
                 <div className="card presale-dashboard">
                   <div className="row between">
-                    <h3>TochikaBet rewards (separate balance)</h3>
+                    <h3>TochikaBet prediction rewards</h3>
                     <span className="presale-pill">BETTING ONLY</span>
                   </div>
                   <div className="grid three">
@@ -1376,69 +1242,6 @@ function App() {
                   >
                     Open TochikaBet predictions
                   </button>
-                </div>
-                <div className="card presale-dashboard">
-                  <div className="row between">
-                    <h3>Genesis presale</h3>
-                    <span className="presale-pill">PREVIEW</span>
-                  </div>
-                  <div className="grid two">
-                    <div>
-                      <small>Presale allocation</small>
-                      <div className="presale-number">
-                        {demoTotal.toLocaleString(undefined, {
-                          maximumFractionDigits: 2,
-                        })}{" "}
-                        TKA
-                      </div>
-                    </div>
-                    <div>
-                      <small>Distribution status</small>
-                      <div className="presale-number">Not open</div>
-                    </div>
-                  </div>
-                  <p className="muted tiny">
-                    No purchases have been recorded by this application.
-                    Youron-chain TKA balance above is separate and it will
-                    reflect after TGE.
-                  </p>
-                  <button
-                    className="secondary"
-                    onClick={() => setPage("Buy TKA")}
-                  >
-                    Explore Genesis Presale
-                  </button>
-                  <div className="divider" />
-                  <h4>History</h4>
-                  {demoRecords.length ? (
-                    demoRecords.map((r) => (
-                      <div className="info" key={r.id}>
-                        <span>
-                          {new Date(r.created).toLocaleString()} · $
-                          {r.usd.toFixed(2)} demo
-                        </span>
-                        <strong>
-                          {r.tka.toLocaleString(undefined, {
-                            maximumFractionDigits: 2,
-                          })}{" "}
-                          TKA · NOT PURCHASED
-                        </strong>
-                      </div>
-                    ))
-                  ) : (
-                    <p className="muted tiny">No practice entries saved.</p>
-                  )}
-                  {!!demoRecords.length && (
-                    <button
-                      className="secondary"
-                      onClick={() => {
-                        localStorage.removeItem(demoKey);
-                        setDemoRecords([]);
-                      }}
-                    >
-                      Clear practice history
-                    </button>
-                  )}
                 </div>
                 <div className="card spaced">
                   <div className="row between">

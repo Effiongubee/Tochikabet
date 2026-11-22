@@ -1,6 +1,9 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ethers } from "ethers";
+import { createAppKit, useAppKit, useAppKitAccount, useAppKitProvider } from "@reown/appkit/react";
+import { EthersAdapter } from "@reown/appkit-adapter-ethers";
+import { bsc } from "@reown/appkit/networks";
 import {
   Wallet,
   ArrowUpRight,
@@ -39,6 +42,24 @@ const tokenConfigured = ethers.isAddress(addresses.token);
 const saleConfigured = tokenConfigured && ethers.isAddress(addresses.sale);
 const stakeConfigured = tokenConfigured && ethers.isAddress(addresses.stake);
 const configured = stakeConfigured;
+
+// Reown AppKit (WalletConnect) enables wallet selection from ordinary browsers.
+// Project IDs are public identifiers; this fallback is the ID supplied for TochikaBet.
+const REOWN_PROJECT_ID = import.meta.env.VITE_REOWN_PROJECT_ID || "c1a1ea39eb03574699e57e9f20daa4bb";
+const appKitMetadata = {
+  name: "TochikaBet",
+  description: "TochikaBet - TKA ecosystem",
+  url: "https://tochikabet.vercel.app",
+  icons: ["https://tochikabet.vercel.app/favicon.ico"],
+};
+createAppKit({
+  adapters: [new EthersAdapter()],
+  networks: [bsc],
+  defaultNetwork: bsc,
+  projectId: REOWN_PROJECT_ID,
+  metadata: appKitMetadata,
+  features: { analytics: true },
+});
 const tokenABI = [
   "function balanceOf(address) view returns(uint256)",
   "function allowance(address,address) view returns(uint256)",
@@ -71,32 +92,10 @@ const recordTxHash = (r) => r.txHash || r.tx_hash || r.transactionHash || r.tran
 const recordTka = (r) => Number(r.tka ?? r.tokenAmount ?? r.token_amount ?? r.token_allocation ?? r.allocation ?? 0);
 const recordBnb = (r) => Number(r.bnb ?? r.bnbAmount ?? r.bnb_amount ?? 0);
 const recordCreatedAt = (r) => r.createdAt || r.created_at || r.timestamp || r.blockTimestamp || null;
-// Resolve the active injected EVM wallet. Some mobile wallet browsers expose
-// multiple providers through window.ethereum.providers rather than directly.
-function getInjectedWallet() {
-  if (typeof window === "undefined") return null;
-  const ethereum = window.ethereum;
-  if (!ethereum) return null;
-  const providers = Array.isArray(ethereum.providers)
-    ? ethereum.providers
-    : [ethereum];
-  return providers.find((wallet) => wallet?.isMetaMask) ||
-    providers.find((wallet) => wallet?.request) ||
-    null;
-}
-
-function isMobileBrowser() {
-  return typeof navigator !== "undefined" &&
-    /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-}
-
-function openMetaMaskApp() {
-  if (typeof window === "undefined") return;
-  const currentDapp = `${window.location.host}${window.location.pathname}${window.location.search}${window.location.hash}`;
-  window.location.href = `https://metamask.app.link/dapp/${currentDapp}`;
-}
-
 function App() {
+  const { open: openWalletModal } = useAppKit();
+  const { address: connectedAddress, isConnected } = useAppKitAccount();
+  const { walletProvider } = useAppKitProvider("eip155");
   const [page, setPage] = useState("Home"),
     [mobile, setMobile] = useState(false),
     [account, setAccount] = useState(""),
@@ -189,14 +188,11 @@ function App() {
     setPaymentMessage("");
     try {
       if (!PAYMENT_API_BASE) throw Error("Payment API URL is missing. Set VITE_PAYMENT_API_URL in Vercel and redeploy.");
-      const wallet = getInjectedWallet();
-      if (!wallet) {
-        if (isMobileBrowser()) {
-          setPaymentMessage("Opening MetaMask. If prompted, open this site in MetaMask and tap Connect Wallet again.");
-          openMetaMaskApp();
-          return;
-        }
-        throw Error("No EVM wallet detected. Install MetaMask or open this site in a wallet browser.");
+      const wallet = walletProvider;
+      if (!wallet || !isConnected) {
+        setPaymentMessage("Choose a wallet to connect. You can use WalletConnect from this browser.");
+        await openWalletModal({ view: "Connect" });
+        return;
       }
       if (!bnbUsd) throw Error(quoteError || "The live BNB/USD quote is unavailable. Please try again shortly.");
       const usd = Number(presaleUsd);
@@ -277,28 +273,13 @@ function App() {
   const alert = (m) => setNotice(m);
   async function connect() {
     try {
-      const wallet = getInjectedWallet();
-      if (!wallet) {
-        if (isMobileBrowser()) {
-          alert("Opening MetaMask. If it asks, choose to open this site in MetaMask, then tap Connect Wallet again.");
-          openMetaMaskApp();
-          return;
-        }
-        throw Error("No EVM wallet detected. Install a wallet extension or open this site in a wallet browser.");
-      }
-      await wallet.request({ method: "eth_requestAccounts" });
-      await switchNetwork(wallet);
-      const p = new ethers.BrowserProvider(wallet);
-      const s = await p.getSigner();
-      setProvider(p);
-      setAccount(await s.getAddress());
-      alert("Wallet connected.");
+      await openWalletModal({ view: "Connect" });
     } catch (e) {
-      alert(e.shortMessage || e.message);
+      alert(e.shortMessage || e.message || "Unable to open the wallet connection window.");
     }
   }
-  async function switchNetwork(wallet = getInjectedWallet()) {
-    if (!wallet) throw Error("No injected EVM wallet detected.");
+  async function switchNetwork(wallet = walletProvider) {
+    if (!wallet) throw Error("Connect an EVM wallet first.");
     try {
       await wallet.request({
         method: "wallet_switchEthereumChain",
@@ -367,26 +348,15 @@ function App() {
     }
   }
   useEffect(() => {
-    const wallet = getInjectedWallet();
-    if (!wallet) return;
-    const init = async () => {
-      try {
-        const accounts = await wallet.request({ method: "eth_accounts" });
-        if (accounts.length) {
-          setProvider(new ethers.BrowserProvider(wallet));
-          setAccount(accounts[0]);
-        }
-      } catch {}
-    };
-    init();
-    const changed = () => window.location.reload();
-    wallet.on?.("accountsChanged", changed);
-    wallet.on?.("chainChanged", changed);
-    return () => {
-      wallet.removeListener?.("accountsChanged", changed);
-      wallet.removeListener?.("chainChanged", changed);
-    };
-  }, []);
+    if (!isConnected || !connectedAddress || !walletProvider) {
+      setAccount("");
+      setProvider(null);
+      setBalance("—");
+      return;
+    }
+    setAccount(connectedAddress);
+    setProvider(new ethers.BrowserProvider(walletProvider));
+  }, [isConnected, connectedAddress, walletProvider]);
   useEffect(() => {
     refresh();
   }, [provider, account]);
@@ -398,8 +368,8 @@ function App() {
       return alert("Staking contract is not configured.");
     setBusy(true);
     try {
-      const wallet = getInjectedWallet();
-      if (!wallet) throw Error("Reconnect your wallet to continue.");
+      const wallet = walletProvider;
+      if (!wallet || !isConnected) throw Error("Reconnect your wallet to continue.");
       await switchNetwork(wallet);
       const p = new ethers.BrowserProvider(wallet),
         signer = await p.getSigner();

@@ -999,7 +999,7 @@ function App() {
                 </div>
                 <div className="info">
                   <span>Distribution</span>
-                  <strong>Recorded now · distributed separately</strong>
+                  <strong>Allocation available for transaction after TGE</strong>
                 </div>
                 <div className="info">
                   <span>Your verified allocation</span>

@@ -878,26 +878,22 @@ function App() {
               ))}
             </div>
             <div className="card spaced">
-              <h3>Allocation to be finalized</h3>
+              <h3>Allocation soon finalized</h3>
               <p>
-                Team, community, liquidity, sale and staking reward allocations
-                have not yet been specified. Do not interpret the full supply as
-                circulating supply.
+                Team, community, liquidity, sales, zealy community, predictions and staking reward allocations
+                will be specified. 
               </p>
-              <p className="muted">
-                Token address: {addresses.token || "Not deployed"}
-              </p>
+             
             </div>
           </section>
         )}
         {page === "Buy TKA" && (
           <section className="section page">
-            <div className="eyebrow">TOCHIKA · BNB PURCHASE</div>
+            <div className="eyebrow">TOCHIKA · PRESALE PURCHASE</div>
             <h1>Buy TKA with BNB.</h1>
             <p className="lead">
-              Pay directly to the official Tochika treasury wallet. After the
-              BNB transaction confirms, the server verifies it and records your
-              TKA allocation at $0.0009 per token.
+              After the presales transaction confirms, the blockchain verifies it and  your
+              TKA allocation is given at $0.0009 per token.
             </p>
             <div className="presale-banner">
               <span>BNB SMART CHAIN MAINNET ·</span>
@@ -964,7 +960,8 @@ function App() {
                   </strong>
                 </div>
                 <p className="muted tiny">
-                  The final BNB amount is calculated from the live quote when you submit. Network gas is paid separately by the buyer. The server independently verifies the transaction and calculates the final TKA allocation.
+                  The final BNB amount is calculated from the live quote when you submit. Network gas is paid separately by the buyer.
+                  The system verifies the transaction and calculates the final TKA allocation.
                 </p>
                 {quoteError && <p className="muted tiny" role="alert">{quoteError}</p>}
                 <button
@@ -995,10 +992,7 @@ function App() {
                   <span>Network</span>
                   <strong>BNB Smart Chain Mainnet</strong>
                 </div>
-                <div className="info">
-                  <span>Receiving wallet</span>
-                  <strong>{short(TREASURY)}</strong>
-                </div>
+               
                 <div className="info">
                   <span>Token price</span>
                   <strong>$0.0009</strong>
